@@ -9,6 +9,15 @@ const Config = {
     jsdelivr: 0
 }
 
+/**
+ * GitHub API Token 配置
+ * 支持两种方式传递 Token（优先级从高到低）：
+ * 1. 请求头 Authorization: token xxx 或 Bearer xxx
+ * 2. 请求头 X-GitHub-Token: xxx
+ * 
+ * 使用 Token 可以提高 API 速率限制（从 60次/小时 提升到 5000次/小时）
+ */
+
 const whiteList = [] // 白名单，路径里面有包含字符的才会通过，e.g. ['/username/']
 
 /** @type {ResponseInit} */
@@ -29,7 +38,14 @@ const exp4 = /^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com\/.+?\/.+?\
 const exp5 = /^(?:https?:\/\/)?gist\.(?:githubusercontent|github)\.com\/.+?\/.+?\/.+$/i
 const exp6 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/tags.*$/i
 const exp7 = /^(?:https?:\/\/)?api\.github\.com\/.*$/i // GitHub API
-const exp8 = /^(?:https?:\/\/)?(.+?)\.github\.io\/api\/.*$/i // GitHub Pages API
+const exp8 = /^(?:https?:\/\/)?(.+?)\.github\.io\/.*$/i // GitHub Pages
+const exp9 = /^(?:https?:\/\/)?avatars\.githubusercontent\.com\/.*$/i // 用户头像
+const exp10 = /^(?:https?:\/\/)?user-images\.githubusercontent\.com\/.*$/i // Issue/PR 上传的图片
+const exp11 = /^(?:https?:\/\/)?camo\.githubusercontent\.com\/.*$/i // README 外链图片代理
+const exp12 = /^(?:https?:\/\/)?objects\.githubusercontent\.com\/.*$/i // Git LFS 大文件
+const exp13 = /^(?:https?:\/\/)?media\.githubusercontent\.com\/.*$/i // 媒体文件
+const exp14 = /^(?:https?:\/\/)?cloud\.githubusercontent\.com\/.*$/i // 云存储资源
+const exp15 = /^(?:https?:\/\/)?favicons\.githubusercontent\.com\/.*$/i // 网站图标
 
 addEventListener('fetch', e => {
     const ret = fetchHandler(e)
@@ -41,7 +57,7 @@ addEventListener('fetch', e => {
 })
 
 function checkUrl(u) {
-    for (let i of [exp1, exp2, exp3, exp4, exp5, exp6, exp7, exp8]) {
+    for (let i of [exp1, exp2, exp3, exp4, exp5, exp6, exp7, exp8, exp9, exp10, exp11, exp12, exp13, exp14, exp15]) {
         if (u.search(i) === 0) {
             return true
         }
@@ -75,6 +91,11 @@ async function fetchHandler(e) {
     path = urlObj.pathname.slice(PREFIX.length)
     path = path.replace(/^\/+/, '') // 移除开头可能的斜杠
     
+    // 重要：保留原始请求的查询参数（如 ?recursive=1）
+    if (urlObj.search) {
+        path += urlObj.search
+    }
+    
     // 路径为空（访问根目录）：返回简单JSON
     if (!path) {
         return new Response(JSON.stringify({ message: 'GitHub Proxy Worker - 请提供有效的 GitHub URL' }), {
@@ -98,25 +119,35 @@ async function fetchHandler(e) {
         })
     }
     
+    // 获取 GitHub Token（优先级：请求头 > 环境变量）
+    const token = getGitHubToken(req)
+    
     // 匹配对应规则并代理
-    if (path.search(exp7) === 0 || path.search(exp8) === 0) {
-        return httpHandler(req, path, true)
+    if (path.search(exp7) === 0) {
+        // GitHub API - 需要特殊处理
+        return httpHandler(req, path, true, token)
     } else if (path.search(exp1) === 0 || path.search(exp5) === 0 || path.search(exp6) === 0 || path.search(exp3) === 0) {
-        return httpHandler(req, path)
+        // Releases, Archive, Gist, Tags, Git Clone
+        return httpHandler(req, path, false, token)
+    } else if (path.search(exp8) === 0 || path.search(exp9) === 0 || path.search(exp10) === 0 || 
+               path.search(exp11) === 0 || path.search(exp12) === 0 || path.search(exp13) === 0 || 
+               path.search(exp14) === 0 || path.search(exp15) === 0) {
+        // GitHub Pages, 头像, 用户图片, Camo, LFS, 媒体文件等静态资源
+        return httpHandler(req, path, false, token)
     } else if (path.search(exp2) === 0) {
         if (Config.jsdelivr) {
             const newUrl = path.replace('/blob/', '@').replace(/^(?:https?:\/\/)?github\.com/, 'https://cdn.jsdelivr.net/gh')
             return Response.redirect(newUrl, 302)
         } else {
             path = path.replace('/blob/', '/raw/')
-            return httpHandler(req, path)
+            return httpHandler(req, path, false, token)
         }
     } else if (path.search(exp4) === 0) {
         if (Config.jsdelivr) {
             const newUrl = path.replace(/(?<=com\/.+?\/.+?)\/(.+?\/)/, '@$1').replace(/^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com/, 'https://cdn.jsdelivr.net/gh')
             return Response.redirect(newUrl, 302)
         } else {
-            return httpHandler(req, path)
+            return httpHandler(req, path, false, token)
         }
     } else {
         return new Response(JSON.stringify({ error: 'Not supported', message: '不支持的资源' }), {
@@ -127,11 +158,38 @@ async function fetchHandler(e) {
 }
 
 /**
+ * 从请求中获取 GitHub Token
+ * @param {Request} req
+ * @returns {string} token
+ */
+function getGitHubToken(req) {
+    const headers = req.headers
+    
+    // 1. 检查 Authorization 头（支持 token xxx 和 Bearer xxx 格式）
+    const authHeader = headers.get('Authorization')
+    if (authHeader) {
+        const tokenMatch = authHeader.match(/^(?:token|Bearer)\s+(.+)$/i)
+        if (tokenMatch) {
+            return tokenMatch[1]
+        }
+    }
+    
+    // 2. 检查 X-GitHub-Token 头
+    const xGitHubToken = headers.get('X-GitHub-Token')
+    if (xGitHubToken) {
+        return xGitHubToken
+    }
+    
+    return ''
+}
+
+/**
  * @param {Request} req
  * @param {string} pathname 完整的目标 URL（如 https://github.com/...）
  * @param {boolean} isApi 是否为 API 请求
+ * @param {string} token GitHub API Token
  */
-function httpHandler(req, pathname, isApi = false) {
+function httpHandler(req, pathname, isApi = false, token = '') {
     const reqHdrRaw = req.headers
 
     // preflight
@@ -142,6 +200,10 @@ function httpHandler(req, pathname, isApi = false) {
     }
 
     const reqHdrNew = new Headers(reqHdrRaw)
+    
+    // 移除客户端传来的认证头（防止泄露到响应中，使用提取的 token）
+    reqHdrNew.delete('Authorization')
+    reqHdrNew.delete('X-GitHub-Token')
 
     let urlStr = pathname
     let flag = !Boolean(whiteList.length)
@@ -185,6 +247,11 @@ function httpHandler(req, pathname, isApi = false) {
         }
         // 移除可能导致问题的头部
         reqHdrNew.delete('Host')
+        
+        // 添加 GitHub API Token 认证（如果有）
+        if (token) {
+            reqHdrNew.set('Authorization', `token ${token}`)
+        }
     }
 
     return proxy(urlObj, reqInit, isApi)
@@ -263,6 +330,3 @@ async function proxy(urlObj, reqInit, isApi = false) {
         })
     }
 }
-
-
-
